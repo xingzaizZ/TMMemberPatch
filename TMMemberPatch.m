@@ -710,6 +710,96 @@ static void TMBlockNoTimePopups(void) {
     }
 }
 
+#pragma mark - 加速链路监控
+
+// 目的是搞清楚"加速到 30% 中断"发生在哪一步。
+// 做法: hook 加速按钮 actionLightning: 与加速中心的全部实例方法，
+// 把调用顺序和参数完整记录，从中定位中断点。
+static void TMHookLightningFlow(void) {
+    Class ic = TMC(@"TMLightning.TMLightningInterfaceCenter");
+    if (!ic) {
+        TMLog(@"[FLOW] !! TMLightningInterfaceCenter 未找到");
+        return;
+    }
+
+    // 1) 加速按钮点击
+    SEL actionSel = sel_registerName("actionLightning:");
+    Method am = class_getInstanceMethod(ic, actionSel);
+    if (am) {
+        IMP orig = method_getImplementation(am);
+        const char *amTypes = method_getTypeEncoding(am);
+        // 确认签名为 v@: 形式（1 个对象参数），否则不替换
+        BOOL sigOK = (amTypes != NULL);
+        if (sigOK) {
+            BOOL added = class_addMethod(ic, actionSel,
+                imp_implementationWithBlock(^(id self_, id sender) {
+                    TMLog(@"[FLOW] >>> actionLightning: sender=%@", sender);
+                    if (orig) ((void (*)(id, SEL, id))orig)(self_, actionSel, sender);
+                    TMLog(@"[FLOW] <<< actionLightning: 完成");
+                }), amTypes);
+            if (!added) {
+                // 方法已在本类，直接替换
+                class_replaceMethod(ic, actionSel,
+                    imp_implementationWithBlock(^(id self_, id sender) {
+                        TMLog(@"[FLOW] >>> actionLightning: sender=%@", sender);
+                        if (orig) ((void (*)(id, SEL, id))orig)(self_, actionSel, sender);
+                        TMLog(@"[FLOW] <<< actionLightning: 完成");
+                    }), amTypes);
+            }
+            TMLog(@"[FLOW] actionLightning: 已 hook (types=%s)", amTypes);
+        }
+    } else {
+        TMLog(@"[FLOW] actionLightning: 未找到");
+    }
+
+    // 2) 遍历加速中心的全部方法，记录被调用的那些。
+    //    注意: 只 hook 无参方法。带参方法用 block 转发会因签名字节数不符导致崩溃，
+    //    所以对有参方法只做"存在性登记"，不替换实现。
+    unsigned int mc = 0;
+    Method *ms = class_copyMethodList(ic, &mc);
+    NSMutableArray *hooked = [NSMutableArray array];
+    NSMutableArray *skipped = [NSMutableArray array];
+    for (unsigned int i = 0; i < mc; i++) {
+        SEL s = method_getName(ms[i]);
+        NSString *sn = NSStringFromSelector(s);
+        NSString *lc = sn.lowercaseString;
+
+        BOOL relevant = [lc containsString:@"lightning"] ||
+                        [lc containsString:@"accel"] ||
+                        [lc containsString:@"node"] ||
+                        [lc containsString:@"speedtest"] ||
+                        [lc containsString:@"verify"];
+        if (!relevant) continue;
+        if ([sn isEqualToString:@"actionLightning:"]) continue;
+
+        const char *types = method_getTypeEncoding(ms[i]);
+        if (!types) continue;
+
+        // 只有无参方法(编码里冒号数为0)才安全替换
+        NSInteger argCount = (NSInteger)[sn componentsSeparatedByString:@":"].count - 1;
+        if (argCount > 0) {
+            [skipped addObject:sn];
+            continue;
+        }
+
+        IMP orig = method_getImplementation(ms[i]);
+        __block NSString *name = [sn copy];
+        class_replaceMethod(ic, s,
+            imp_implementationWithBlock(^(id self_) {
+                TMLog(@"[FLOW] >> %@", name);
+                ((void (*)(id, SEL))orig)(self_, s);
+            }),
+            types);
+        [hooked addObject:sn];
+    }
+    free(ms);
+    TMLog(@"[FLOW] 已监控 %lu 个无参方法: %@", (unsigned long)hooked.count,
+          [hooked componentsJoinedByString:@", "]);
+    if (skipped.count) {
+        TMLog(@"[FLOW] 带参方法(仅登记): %@", [skipped componentsJoinedByString:@", "]);
+    }
+}
+
 #pragma mark - 全局兜底: 扫描所有相关类并注入 getter
 
 // 逆向时能列出的类只是"入口类"。真正决定界面显示的可能是某个 Model、
@@ -1001,6 +1091,7 @@ static void TMInit(void) {
             TMInstallIAP();
             TMInstallUI();
             TMBlockNoTimePopups();
+            TMHookLightningFlow();
             TMInspectAds();
             TMLog(@"==== 注入阶段2: 完成 ====");
         });
