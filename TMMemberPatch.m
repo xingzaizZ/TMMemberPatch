@@ -22,12 +22,6 @@ static void TMLog(NSString *fmt, ...) {
 
 #pragma mark - 安全 hook 原语
 
-// 给类添加方法，若已存在则替换实现（不交换，避免原实现丢失）
-static BOOL TMOverrideInstanceMethod(Class cls, SEL sel, IMP imp, const char *types) {
-    if (!cls || !sel || !imp) return NO;
-    return class_addMethod(cls, sel, imp, types) ?: YES;
-}
-
 // 添加或替换实例方法（存在就 replace）
 static void TMForceSetInstanceMethod(Class cls, SEL sel, IMP imp, const char *types) {
     if (!cls || !sel) return;
@@ -35,9 +29,6 @@ static void TMForceSetInstanceMethod(Class cls, SEL sel, IMP imp, const char *ty
     Method m = class_getInstanceMethod(cls, sel);
     if (m) class_replaceMethod(cls, sel, imp, types);
 }
-
-// block 转 IMP，保留原实现的转发
-typedef IMP (^TMIMPFactory)(IMP original);
 
 #pragma mark - 通用 getter 注入
 
@@ -78,62 +69,6 @@ static void TMInstallMemberGetters(Class cls, NSString *tag) {
 }
 
 #pragma mark - 用户态字典改写
-
-static NSDictionary *TMPatchDict(NSDictionary *dict, int depth);
-
-static id TMPatchValueForKey(id key, id value) {
-    NSString *k = [key isKindOfClass:[NSString class]] ? [key lowercaseString] : @"";
-    if (k.length == 0) return value;
-
-    // 1) 布尔标记
-    static NSSet *boolKeys;
-    static dispatch_once_t once1;
-    dispatch_once(&once1, ^{
-        boolKeys = [NSSet setWithObjects:
-            @"isvip", @"is_vip", @"isvipmember", @"vip", @"svip", @"issvip",
-            @"member", @"ismember", @"is_ad_free", @"isadfree", @"adfree",
-            @"adafree", @"isvipuser", @"isvalid", nil];
-    });
-    if ([boolKeys containsObject:k] && ![value isKindOfClass:[NSNull class]]) {
-        return @YES;
-    }
-
-    // 2) 时间/时长型
-    static NSSet *timeKeys;
-    static dispatch_once_t once2;
-    dispatch_once(&once2, ^{
-        timeKeys = [NSSet setWithObjects:
-            @"ad_free_time", @"adfreetime", @"free_time", @"freetime",
-            @"sendfreetime", @"vip_end_time", @"vipendtime", @"vipend",
-            @"expire_time", @"expiretime", @"expire", @"endtime", @"end_time",
-            @"ad_end_time", @"adendtime", @"vip_end", nil];
-    });
-    if ([timeKeys containsObject:k] && [value respondsToSelector:@selector(doubleValue)]) {
-        double d = [value doubleValue];
-        // 毫秒字段给毫秒，秒字段给秒
-        if (d > 1e11) return @(kExpireSec * 1000.0);
-        if (d > 0 || [value isKindOfClass:[NSNumber class]]) return @(kExpireSec);
-    }
-
-    // 3) 日期字符串
-    static NSSet *strKeys;
-    static dispatch_once_t once3;
-    dispatch_once(&once3, ^{
-        strKeys = [NSSet setWithObjects:
-            @"vip_end_time_str", @"vipendtimestr", @"expiredate", @"expire_date",
-            @"validuntil", @"expired", @"vip_time", @"viptime", nil];
-    });
-    if ([strKeys containsObject:k] && [value isKindOfClass:[NSString class]]) {
-        return kExpireText;
-    }
-
-    // 4) 递归
-    if ([value isKindOfClass:[NSDictionary class]]) return TMPatchDict(value, depth_hack);
-    return value;
-}
-
-// 上面无法引外部变量，改用显式版本
-static int depth_hack = 0;
 
 static NSDictionary *TMPatchDict(NSDictionary *dict, int depth) {
     if (![dict isKindOfClass:[NSDictionary class]]) return dict;
