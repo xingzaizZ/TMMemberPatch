@@ -101,6 +101,10 @@ static void TMInstallMemberGetters(Class cls, NSString *tag) {
 
 #pragma mark - 用户态字典改写
 
+// 诊断行缓冲（定义在此，供后续各函数使用）
+static NSMutableArray<NSString *> *gDiagLines = nil;
+static void TMDiagAdd(NSString *line);
+
 // 递归收集所有叶子字段名，用于日志核对
 static void TMCollectKeys(id obj, NSMutableArray *out, int depth) {
     if (depth > 6 || !out) return;
@@ -661,8 +665,10 @@ static void TMDumpRuntime(void) {
     free(all);
 
     TMLog(@"[DUMP] 命中类 %lu 个", (unsigned long)hits.count);
+    TMDiagAdd([NSString stringWithFormat:@"命中类 %lu 个", (unsigned long)hits.count]);
     for (NSString *cn in [hits sortedArrayUsingSelector:@selector(compare:)]) {
         TMLog(@"[DUMP]   %@", cn);
+        TMDiagAdd([NSString stringWithFormat:@"· %@", cn]);
     }
 
     // 3) 逐个列出这些类的 getter 方法（is/expire 开头）
@@ -700,6 +706,99 @@ static void TMDumpRuntime(void) {
     TMLog(@"[DUMP] ===== 运行时类扫描结束 =====");
 }
 
+#pragma mark - 诊断输出: 弹窗 + 共享目录
+
+static void TMDiagAdd(NSString *line) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ gDiagLines = [NSMutableArray array]; });
+    if (line) [gDiagLines addObject:line];
+}
+
+static NSString *TMGlobalDiagSummary(void) {
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"注入: 成功\n"];
+    [s appendFormat:@"权益: %@\n", kExpireText];
+
+    // 关键类解析结果
+    Class uc = TMC(@"TMLightning.TMUserInfoCenter");
+    Class lc = TMC(@"TMLightning.TMLightningCenter");
+    Class pv = TMC(@"TMLightning.TMAdFreePayView");
+    [s appendFormat:@"\nUserInfoCenter: %@\n", uc ? @"✓" : @"✗ 缺失"];
+    [s appendFormat:@"LightningCenter: %@\n", lc ? @"✓" : @"✗ 缺失"];
+    [s appendFormat:@"AdFreePayView: %@\n", pv ? @"✓" : @"✗ 缺失"];
+
+    if (uc) [s appendFormat:@"实际名: %s\n", class_getName(uc)];
+
+    if (gDiagLines.count) {
+        [s appendString:@"\n扫描结果:\n"];
+        NSUInteger n = MIN(gDiagLines.count, 12);
+        for (NSUInteger i = 0; i < n; i++) {
+            [s appendFormat:@"%@\n", gDiagLines[i]];
+        }
+    }
+
+    [s appendFormat:@"\n日志: Documents/tmpatch.log"];
+    return s;
+}
+
+// 在屏幕上直接显示诊断结论，TrollFools 场景下不需要抓日志
+static void TMShowDiagAlert(void) {
+    NSString *msg = TMGlobalDiagSummary();
+    if (!msg.length) msg = @"(空)";
+
+    UIAlertController *ac =
+        [UIAlertController alertControllerWithTitle:@"TMPatch 诊断"
+                                            message:msg
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"知道了"
+                                           style:UIAlertActionStyleDefault
+                                         handler:nil]];
+
+    // 找最顶层的 ViewController 来 present
+    UIWindow *keyWin = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.isKeyWindow) { keyWin = w; break; }
+    }
+    if (!keyWin) keyWin = [UIApplication sharedApplication].windows.firstObject;
+    UIViewController *root = keyWin.rootViewController;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (root) {
+            [root presentViewController:ac animated:YES completion:nil];
+            TMLog(@"[DIAG] 诊断弹窗已显示");
+        } else {
+            TMLog(@"[DIAG] 找不到 rootViewController，弹窗失败");
+        }
+    });
+}
+
+// 把沙盒内的日志复制到 /var/mobile/Documents/（越狱设备）或共享容器
+static void TMCopyLogToShared(void) {
+    NSString *src = TMLogPath();
+    if (!src.length) return;
+
+    NSArray *candidates = @[@"/var/mobile/Documents/tmpatch.log",
+                            @"/var/mobile/Media/tmpatch.log",
+                            @"/tmp/tmpatch.log"];
+    for (NSString *dst in candidates) {
+        NSString *dir = [dst stringByDeletingLastPathComponent];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:dir]) continue;
+        NSError *e = nil;
+        if ([[NSFileManager defaultManager] copyItemAtPath:src toPath:dst error:&e]) {
+            TMLog(@"[DIAG] 日志已复制到 %@", dst);
+        }
+    }
+
+    // 读回内容，打印到 console 方便 AirDrop 前先看一眼
+    NSString *content = [NSString stringWithContentsOfFile:src
+                                                 encoding:NSUTF8StringEncoding
+                                                    error:NULL];
+    if (content.length) {
+        TMLog(@"[DIAG] 日志文件 %@ (%lu 字节)", src, (unsigned long)content.length);
+    }
+}
+
 __attribute__((constructor))
 static void TMInit(void) {
     @autoreleasepool {
@@ -721,6 +820,10 @@ static void TMInit(void) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 TMDumpRuntime();
+                // 屏幕上弹出诊断摘要，不用抓日志也能看到
+                TMShowDiagAlert();
+                // 尝试把日志复制到可访问位置
+                TMCopyLogToShared();
             });
         });
     }
