@@ -712,91 +712,109 @@ static void TMBlockNoTimePopups(void) {
 
 #pragma mark - 加速链路监控
 
-// 目的是搞清楚"加速到 30% 中断"发生在哪一步。
-// 做法: hook 加速按钮 actionLightning: 与加速中心的全部实例方法，
-// 把调用顺序和参数完整记录，从中定位中断点。
+// 修正: 加速状态的实际持有者是 TMLightningCenter，不是 TMLightningInterfaceCenter。
+// 上一版 hook 后者，日志显示 "actionLightning: 未找到 / 已监控 0 个无参方法"。
+//
+// 二进制确认的 TMLightningCenter 加速状态字段:
+//   lightningGameModel / lightningServerModel / lightningNodeModel
+//   isHadBeginSpeedup / hadChoice / vpnStatus
+//   isSpeedTimerStarted / startLightningTime / isHadStartVPN
+//   lightningProgressPopupView / lightningErrorPopupView
+// 错误文案: 加速时间已用完 / VPN启动超时失败 / 当前网络不可用 / 加速断卡
 static void TMHookLightningFlow(void) {
-    Class ic = TMC(@"TMLightning.TMLightningInterfaceCenter");
-    if (!ic) {
-        TMLog(@"[FLOW] !! TMLightningInterfaceCenter 未找到");
+    NSArray *candidates = @[@"TMLightning.TMLightningCenter",
+                            @"TMLightning.TMLightningInterfaceCenter"];
+    Class target = nil;
+    NSString *targetName = nil;
+    for (NSString *n in candidates) {
+        Class c = TMC(n);
+        if (c) { target = c; targetName = n; break; }
+    }
+    if (!target) {
+        TMLog(@"[FLOW] !! 两个候选类都未找到");
         return;
     }
+    unsigned int probeCount = 0;
+    Method *probeMethods = class_copyMethodList(target, &probeCount);
+    if (probeMethods) free(probeMethods);
+    TMLog(@"[FLOW] 监控目标: %@ (%u 个实例方法)", targetName, probeCount);
 
     // 1) 加速按钮点击
     SEL actionSel = sel_registerName("actionLightning:");
-    Method am = class_getInstanceMethod(ic, actionSel);
+    Method am = class_getInstanceMethod(target, actionSel);
     if (am) {
         IMP orig = method_getImplementation(am);
         const char *amTypes = method_getTypeEncoding(am);
-        // 确认签名为 v@: 形式（1 个对象参数），否则不替换
-        BOOL sigOK = (amTypes != NULL);
-        if (sigOK) {
-            BOOL added = class_addMethod(ic, actionSel,
-                imp_implementationWithBlock(^(id self_, id sender) {
-                    TMLog(@"[FLOW] >>> actionLightning: sender=%@", sender);
-                    if (orig) ((void (*)(id, SEL, id))orig)(self_, actionSel, sender);
-                    TMLog(@"[FLOW] <<< actionLightning: 完成");
-                }), amTypes);
-            if (!added) {
-                // 方法已在本类，直接替换
-                class_replaceMethod(ic, actionSel,
-                    imp_implementationWithBlock(^(id self_, id sender) {
-                        TMLog(@"[FLOW] >>> actionLightning: sender=%@", sender);
-                        if (orig) ((void (*)(id, SEL, id))orig)(self_, actionSel, sender);
-                        TMLog(@"[FLOW] <<< actionLightning: 完成");
-                    }), amTypes);
-            }
-            TMLog(@"[FLOW] actionLightning: 已 hook (types=%s)", amTypes);
-        }
+        class_replaceMethod(target, actionSel,
+            imp_implementationWithBlock(^(id self_, id sender) {
+                TMLog(@"[FLOW] >>> actionLightning: sender=%@", sender);
+                if (orig) ((void (*)(id, SEL, id))orig)(self_, actionSel, sender);
+                TMLog(@"[FLOW] <<< actionLightning: 完成");
+            }), amTypes);
+        TMLog(@"[FLOW] actionLightning: 已 hook");
     } else {
-        TMLog(@"[FLOW] actionLightning: 未找到");
+        TMLog(@"[FLOW] actionLightning: 不在 %@", targetName);
     }
 
-    // 2) 遍历加速中心的全部方法，记录被调用的那些。
-    //    注意: 只 hook 无参方法。带参方法用 block 转发会因签名字节数不符导致崩溃，
-    //    所以对有参方法只做"存在性登记"，不替换实现。
+    // 2) 遍历全部实例方法，把加速相关无参方法加日志
     unsigned int mc = 0;
-    Method *ms = class_copyMethodList(ic, &mc);
+    Method *ms = class_copyMethodList(target, &mc);
     NSMutableArray *hooked = [NSMutableArray array];
-    NSMutableArray *skipped = [NSMutableArray array];
+    NSMutableArray *registered = [NSMutableArray array];
     for (unsigned int i = 0; i < mc; i++) {
         SEL s = method_getName(ms[i]);
         NSString *sn = NSStringFromSelector(s);
         NSString *lc = sn.lowercaseString;
 
         BOOL relevant = [lc containsString:@"lightning"] ||
-                        [lc containsString:@"accel"] ||
+                        [lc containsString:@"speedup"] ||
+                        [lc containsString:@"vpn"] ||
                         [lc containsString:@"node"] ||
-                        [lc containsString:@"speedtest"] ||
-                        [lc containsString:@"verify"];
+                        [lc containsString:@"start"] ||
+                        [lc containsString:@"stop"] ||
+                        [lc containsString:@"accel"];
         if (!relevant) continue;
         if ([sn isEqualToString:@"actionLightning:"]) continue;
 
-        const char *types = method_getTypeEncoding(ms[i]);
-        if (!types) continue;
-
-        // 只有无参方法(编码里冒号数为0)才安全替换
         NSInteger argCount = (NSInteger)[sn componentsSeparatedByString:@":"].count - 1;
         if (argCount > 0) {
-            [skipped addObject:sn];
+            [registered addObject:sn];
             continue;
         }
 
+        const char *types = method_getTypeEncoding(ms[i]);
+        if (!types) continue;
         IMP orig = method_getImplementation(ms[i]);
         __block NSString *name = [sn copy];
-        class_replaceMethod(ic, s,
+        class_replaceMethod(target, s,
             imp_implementationWithBlock(^(id self_) {
                 TMLog(@"[FLOW] >> %@", name);
                 ((void (*)(id, SEL))orig)(self_, s);
-            }),
-            types);
+            }), types);
         [hooked addObject:sn];
     }
     free(ms);
-    TMLog(@"[FLOW] 已监控 %lu 个无参方法: %@", (unsigned long)hooked.count,
+
+    TMLog(@"[FLOW] 无参方法已挂日志(%lu): %@", (unsigned long)hooked.count,
           [hooked componentsJoinedByString:@", "]);
-    if (skipped.count) {
-        TMLog(@"[FLOW] 带参方法(仅登记): %@", [skipped componentsJoinedByString:@", "]);
+    TMLog(@"[FLOW] 带参方法(%lu, 仅登记): %@", (unsigned long)registered.count,
+          [registered componentsJoinedByString:@", "]);
+
+    // 3) 关键布尔属性: isHadBeginSpeedup 强制为 YES，
+    //    避免"加速时间已用完"这类判断把流程掐断
+    for (NSString *getter in @[@"isHadBeginSpeedup", @"isHadStartVPN",
+                               @"isSpeedTimerStarted", @"hadChoice"]) {
+        SEL gs = sel_registerName(getter.UTF8String);
+        Method gm = class_getInstanceMethod(target, gs);
+        if (gm) {
+            const char *tp = method_getTypeEncoding(gm);
+            const char *ret = method_copyReturnType(gm);
+            if (ret && (ret[0] == 'c' || ret[0] == 'B')) {
+                class_replaceMethod(target, gs, (IMP)TM_ReturnBoolYES, tp);
+                TMLog(@"[FLOW] -%@ -> YES", getter);
+            }
+            if (ret) free((void *)ret);
+        }
     }
 }
 
