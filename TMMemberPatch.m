@@ -332,13 +332,37 @@ static void TMSweepLabels(UIView *v, int depth) {
 
         BOOL changed = NO;
         NSString *nt = t;
+
         if ([t containsString:@"有效期至"] || [t containsString:@"有效期至:"]) {
             nt = [NSString stringWithFormat:@"有效期至：%@", kExpireText];
             changed = YES;
-        } else if ([t containsString:@"权益仅剩"] || [t containsString:@"剩余时长"]) {
+        }
+        else if ([t containsString:@"权益仅剩"] || [t containsString:@"剩余时长"]) {
             nt = @"权益有效期：永久";
             changed = YES;
         }
+        // 断言: "加速时长不足2小时" / "当前没有加速时长" / "您的加速时长耗尽" 全部改成正常文案
+        else if ([t containsString:@"加速时长不足"] || [t containsString:@"没有加速时长"] ||
+                 [t containsString:@"时长耗尽"] || [t containsString:@"没有时长"]) {
+            nt = @"加速时长充足";
+            changed = YES;
+        }
+        // 修正显示单位: "166666时" 这种明显不对的数字，统一成"充足"
+        else if ([t containsString:@"时"] && !changed) {
+            // 匹配 "免费加速时长 166666时" / "当前可加速时长：166666时"
+            NSRegularExpression *re =
+                [NSRegularExpression regularExpressionWithPattern:@"([0-9]{5,})\\s*时"
+                                                          options:0 error:NULL];
+            NSRange full = NSMakeRange(0, t.length);
+            NSString *replaced = [re stringByReplacingMatchesInString:t options:0
+                                                                range:full
+                                                         withTemplate:@"充足"];
+            if (![replaced isEqualToString:t]) {
+                nt = replaced;
+                changed = YES;
+            }
+        }
+
         if (changed && ![nt isEqualToString:t]) {
             if ([v isKindOfClass:[UILabel class]]) ((UILabel *)v).text = nt;
             else [((UIButton *)v) setTitle:nt forState:UIControlStateNormal];
@@ -605,6 +629,55 @@ static void TMInstallUI(void) {
 static void TMInstallIAP(void) {
     Class c = TMC(@"TMLightning.TMAppleIAPCentre");
     if (c) TMInstallMemberGetters(c, @"TMAppleIAPCentre");
+}
+
+#pragma mark - 拦截"没有加速时长"弹窗
+
+// 点击加速时 App 会先校验时长，不足就弹窗并中止。
+// 实测弹窗类: TMNoTimeLookAdPopupView("当前没有加速时长")、
+//             TMLightningNoTimePopView("加速时长耗尽")、
+//             TMLightningTimeShortageView("加速时长不足2小时")
+// 直接把这些弹窗的展示方法拦掉，让加速流程继续往下走。
+static void TMBlockNoTimePopups(void) {
+    NSArray *popups = @[@"TMLightning.TMNoTimeLookAdPopupView",
+                        @"TMLightning.TMLightningNoTimePopView",
+                        @"TMLightning.TMLightningTimeShortageView",
+                        @"TMLightning.TMLookVideAdNeedNumPopupView",
+                        @"TMLightning.TMVideAdSuccessTimePopupView",
+                        @"TMLightning.TMLightningNeedTimePopupView"];
+
+    // 这些是"弹窗展示"的通用方法名
+    NSArray *showSels = @[@"show", @"showInView:", @"showInWindow",
+                          @"showWithAnimated:", @"present", @"presentFrom:"];
+
+    for (NSString *n in popups) {
+        Class c = TMC(n);
+        if (!c) continue;
+        int blocked = 0;
+        for (NSString *sn in showSels) {
+            SEL s = sel_registerName(sn.UTF8String);
+            Method m = class_getInstanceMethod(c, s);
+            if (m) {
+                class_replaceMethod(c, s, (IMP)TM_Noop, method_getTypeEncoding(m));
+                blocked++;
+            }
+        }
+        // 兜底: 只要在屏幕上出现，直接移除
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        for (unsigned int i = 0; i < mc; i++) {
+            NSString *sel = NSStringFromSelector(method_getName(ms[i]));
+            NSString *lc = sel.lowercaseString;
+            if (([lc hasPrefix:@"show"] || [lc hasPrefix:@"present"]) &&
+                ([sel componentsSeparatedByString:@":"].count - 1) <= 1) {
+                const char *tp = method_getTypeEncoding(ms[i]);
+                class_replaceMethod(c, method_getName(ms[i]), (IMP)TM_Noop, tp);
+                blocked++;
+            }
+        }
+        free(ms);
+        TMLog(@"[POPUP] %@ 拦截 %d 个展示方法", n, blocked);
+    }
 }
 
 #pragma mark - 全局兜底: 扫描所有相关类并注入 getter
@@ -897,6 +970,7 @@ static void TMInit(void) {
             TMInstallUserHooks();
             TMInstallIAP();
             TMInstallUI();
+            TMBlockNoTimePopups();
             TMInspectAds();
             TMLog(@"==== 注入阶段2: 完成 ====");
         });
