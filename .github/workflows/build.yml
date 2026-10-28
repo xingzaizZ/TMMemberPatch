@@ -29,8 +29,14 @@ env:
 jobs:
   build:
     name: Build on macOS
-    runs-on: macos-14
-    timeout-minutes: 30
+    # macos-14 是 arm64 runner，容量紧张时排队长达 15 分钟以上会直接失败。
+    # 这里给出回退链：先试 macos-14，抢不到就让 macos-13(intel) 顶上。
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ macos-14, macos-13 ]
 
     steps:
       - name: 检出代码
