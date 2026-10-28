@@ -266,9 +266,56 @@ static void TMSweepLabels(UIView *v, int depth) {
 
 #pragma mark - 安装
 
+// Swift 类在 ObjC 运行时的注册名是 mangled 形式（如 _TtC11TMLightning16TMUserInfoCenter），
+// NSClassFromString 对 "TMLightning.TMUserInfoCenter" 这种点号写法解析不到。
+// 这里依次尝试三种写法，任何一个命中即可。
 static Class TMC(NSString *n) {
+    if (!n.length) return Nil;
+
+    // 1) 原样查（ObjC 类）
     Class c = NSClassFromString(n);
-    if (!c) TMLog(@"缺类 %@", n);
+    if (c) return c;
+
+    // 2) 点号形式 -> 去掉模块名，只查类名
+    NSString *simple = n;
+    NSRange dot = [n rangeOfString:@"."];
+    if (dot.location != NSNotFound) {
+        simple = [n substringFromIndex:dot.location + 1];
+        c = NSClassFromString(simple);
+        if (c) {
+            TMLog(@"类 %@ 解析为 %@", n, NSStringFromClass(c));
+            return c;
+        }
+    }
+
+    // 3) Swift mangled 形式: _TtC<模块名长度><模块名><类名长度><类名>
+    NSString *mod = (dot.location != NSNotFound) ? [n substringToIndex:dot.location] : @"TMLightning";
+    NSString *mangled = [NSString stringWithFormat:@"_TtC%lu%@%lu%@",
+                         (unsigned long)mod.length, mod,
+                         (unsigned long)simple.length, simple];
+    c = NSClassFromString(mangled);
+    if (c) {
+        TMLog(@"类 %@ 解析为 %@", n, mangled);
+        return c;
+    }
+
+    // 4) 兜底：遍历所有已注册类，按后缀匹配
+    int count = objc_getClassList(NULL, 0);
+    if (count > 0) {
+        Class *all = (Class *)malloc(sizeof(Class) * count);
+        count = objc_getClassList(all, count);
+        for (int i = 0; i < count; i++) {
+            NSString *cn = NSStringFromClass(all[i]);
+            if ([cn hasSuffix:simple] && cn.length <= simple.length + 24) {
+                c = all[i];
+                TMLog(@"类 %@ 后缀匹配为 %@", n, cn);
+                break;
+            }
+        }
+        free(all);
+    }
+
+    if (!c) TMLog(@"!! 缺类 %@（四种方式均未找到）", n);
     return c;
 }
 
@@ -375,6 +422,180 @@ static void TMInstallIAP(void) {
     if (c) TMInstallMemberGetters(c, @"TMAppleIAPCentre");
 }
 
+#pragma mark - 全局兜底: 扫描所有相关类并注入 getter
+
+// 逆向时能列出的类只是"入口类"。真正决定界面显示的可能是某个 Model、
+// ViewModel 或单例，未必在名单里。这里把运行时里所有名字带 vip/adfree/user 的类
+// 全部扫一遍，凡是有 is 开头布尔字段的，统一返回"会员态"。
+static void TMInstallBroadSweep(void) {
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return;
+
+    Class *all = (Class *)malloc(sizeof(Class) * count);
+    if (!all) return;
+    count = objc_getClassList(all, count);
+
+    int touched = 0;
+    NSMutableArray *touchedNames = [NSMutableArray array];
+
+    for (int i = 0; i < count; i++) {
+        Class c = all[i];
+        NSString *cn = NSStringFromClass(c);
+        if (!cn.length) continue;
+
+        NSString *lc = cn.lowercaseString;
+        BOOL relevant = [lc containsString:@"vip"] ||
+                        [lc containsString:@"adfree"] ||
+                        [lc containsString:@"userinfo"] ||
+                        [lc containsString:@"member"];
+        if (!relevant) continue;
+
+        // 跳过系统类与第三方 SDK，只处理主程序模块的类
+        if ([cn hasPrefix:@"NS"] || [cn hasPrefix:@"UI"] || [cn hasPrefix:@"CA"] ||
+            [cn hasPrefix:@"_NS"] || [cn hasPrefix:@"__"] ||
+            [lc containsString:@"gdt"] || [lc containsString:@"awm"] ||
+            [lc containsString:@"baidu"] || [lc containsString:@"bytedance"] ||
+            [lc containsString:@"pangle"] || [lc containsString:@"wind"] ||
+            [lc containsString:@"sigmob"] || [lc containsString:@"ksad"] ||
+            [lc containsString:@"unity"] || [lc containsString:@"applovin"] ||
+            [lc containsString:@"inmobi"] || [lc containsString:@"mintegral"]) {
+            continue;
+        }
+
+        // 只看本模块的类（Swift mangled 名里带 TMLightning）
+        if (![cn containsString:@"TMLightning"] && ![cn hasPrefix:@"TM"]) {
+            continue;
+        }
+
+        // 取出该类已有的全部变量与方法，把疑似会员 getter 改成返回 YES
+        BOOL did = NO;
+
+        unsigned int mcount = 0;
+        Method *ms = class_copyMethodList(c, &mcount);
+        for (unsigned int j = 0; j < mcount; j++) {
+            NSString *sn = NSStringFromSelector(method_getName(ms[j]));
+            const char *type = method_getTypeEncoding(ms[j]);
+            if (!type) continue;
+
+            BOOL isGetter = ([sn hasPrefix:@"is"] || [sn hasPrefix:@"has"] ||
+                             [sn hasPrefix:@"could"] || [sn hasPrefix:@"should"] ||
+                             [sn hasPrefix:@"can"]);
+            if (!isGetter) continue;
+
+            const char *ret = method_copyReturnType(ms[j]);
+            BOOL retBool = (ret && (ret[0] == 'c' || ret[0] == 'B'));
+            BOOL retObj  = (ret && ret[0] == '@');
+            if (ret) free((void *)ret);
+
+            NSString *lcs = sn.lowercaseString;
+            BOOL looksMember = ([lcs containsString:@"vip"] ||
+                               [lcs containsString:@"member"] ||
+                               [lcs containsString:@"adfree"] ||
+                               [lcs containsString:@"ad_free"]);
+
+            if (looksMember && retBool) {
+                class_replaceMethod(c, method_getName(ms[j]), (IMP)TM_ReturnBoolYES, type);
+                did = YES;
+            } else if (looksMember && retObj) {
+                class_replaceMethod(c, method_getName(ms[j]), (IMP)TM_ReturnYES, type);
+                did = YES;
+            }
+        }
+        free(ms);
+
+        // 补齐标准 getter
+        TMInstallMemberGetters(c, cn);
+
+        if (did) {
+            touched++;
+            [touchedNames addObject:cn];
+        }
+    }
+
+    free(all);
+    TMLog(@"宽扫完成: 命中并改写 %d 个类", touched);
+    if (touchedNames.count) {
+        TMLog(@"宽扫类清单: %@", [touchedNames componentsJoinedByString:@", "]);
+    }
+}
+
+#pragma mark - 诊断: 导出真实的会员相关类与实例
+
+// 把运行时的实际情况打到日志里，用来核对类名/方法名是否与逆向结果一致。
+// 输出在 Console.app 或 idevicesyslog 里，关键字 [TMPatch][DUMP]
+static void TMDumpRuntime(void) {
+    TMLog(@"[DUMP] ===== 运行时类扫描开始 =====");
+
+    // 1) 目标类是否真的存在
+    NSArray *targets = @[@"TMUserInfoCenter", @"TMUserInfoDefaults", @"TMCommonDefaults",
+                         @"TMLightningCenter", @"TMLightningInterfaceCenter",
+                         @"TMAdFreePayView", @"TMAdFreePayViewController",
+                         @"TMAppleIAPCentre", @"TMAdManager", @"TMSplashAdManager",
+                         @"TMInterstitialAdManager", @"TMRewardedVideoAdManager",
+                         @"TMLookVideoAdViewController"];
+    for (NSString *t in targets) {
+        NSString *full = [@"TMLightning." stringByAppendingString:t];
+        Class c = TMC(full);
+        TMLog(@"[DUMP] 类 %-30s -> %s", t.UTF8String, c ? class_getName(c) : "缺失");
+    }
+
+    // 2) 扫出所有含 vip/adfree 关键字的类
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return;
+    Class *all = (Class *)malloc(sizeof(Class) * count);
+    count = objc_getClassList(all, count);
+
+    NSMutableArray *hits = [NSMutableArray array];
+    for (int i = 0; i < count; i++) {
+        NSString *cn = NSStringFromClass(all[i]);
+        NSString *lc = cn.lowercaseString;
+        if ([lc containsString:@"vip"] || [lc containsString:@"adfree"] ||
+            [lc containsString:@"userinfo"]) {
+            [hits addObject:cn];
+        }
+    }
+    free(all);
+
+    TMLog(@"[DUMP] 命中类 %lu 个", (unsigned long)hits.count);
+    for (NSString *cn in [hits sortedArrayUsingSelector:@selector(compare:)]) {
+        TMLog(@"[DUMP]   %@", cn);
+    }
+
+    // 3) 逐个列出这些类的 getter 方法（is/expire 开头）
+    for (NSString *cn in hits) {
+        Class c = NSClassFromString(cn);
+        if (!c) continue;
+        unsigned int mcount = 0;
+        Method *ms = class_copyMethodList(c, &mcount);
+        if (!ms) continue;
+        NSMutableArray *getters = [NSMutableArray array];
+        for (unsigned int i = 0; i < mcount; i++) {
+            NSString *sn = NSStringFromSelector(method_getName(ms[i]));
+            if ([sn hasPrefix:@"is"] || [sn hasPrefix:@"get"] ||
+                [sn.lowercaseString containsString:@"expire"] ||
+                [sn.lowercaseString containsString:@"vip"]) {
+                [getters addObject:sn];
+            }
+        }
+        free(ms);
+        if (getters.count) {
+            TMLog(@"[DUMP] %@: %@", cn, [getters componentsJoinedByString:@", "]);
+        }
+    }
+
+    // 4) 当前 NSUserDefaults 里的会员相关键
+    NSDictionary *defs = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+    for (NSString *k in defs) {
+        NSString *lc = k.lowercaseString;
+        if ([lc containsString:@"vip"] || [lc containsString:@"ad"] ||
+            [lc containsString:@"free"] || [lc containsString:@"user"]) {
+            TMLog(@"[DUMP] defaults[%@] = %@", k, defs[k]);
+        }
+    }
+
+    TMLog(@"[DUMP] ===== 运行时类扫描结束 =====");
+}
+
 __attribute__((constructor))
 static void TMInit(void) {
     @autoreleasepool {
@@ -386,7 +607,17 @@ static void TMInit(void) {
             TMInstallAds();
             TMInstallUI();
             TMInstallIAP();
+
+            // 全局兜底：把运行时里所有会员相关类的 getter 拉满
+            TMInstallBroadSweep();
+
             TMLog(@"==== 注入完成, 免广告权益 -> %@ ====", kExpireText);
+
+            // 延迟 3 秒导出运行时的真实结构，供核对
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                TMDumpRuntime();
+            });
         });
     }
 }
