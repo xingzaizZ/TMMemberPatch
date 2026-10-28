@@ -20,8 +20,12 @@ static NSString * const kExpireText = @"2045-11-01";
 // 结论: ad_free_time / free_time / vipMinutes 单位统一为「分钟」，
 //       界面的"有效期至"= 当前时间 + 该分钟数。
 //
-// 要让界面自然显示 2045-11-01，需 9998264 分钟（约 19.02 年）。
-// 这里取整为 kRemainMinutes，并保留余量，确保跨年后仍不会回落到更早年份。
+// 同一字段同时驱动两处显示:
+//   有效期至 = 当前时间 + N 分钟
+//   免费加速时长 = N / 60 时 M 分
+// 两者共用 N，所以有效期越长，剩余时长显示越大，无法同时兼顾。
+// 实测 N=9998264(19年) 时，剩余时长显示 "166666时40分"，日期 2045-11-01 正确。
+// 这里保持 N 不变，优先保证有效期正确 —— 剩余时长显示大数字属于预期表现。
 static const double kRemainMinutes = 9998264.0;
 
 // 日志同时写文件，不用抓 syslog 也能拿到诊断
@@ -676,7 +680,33 @@ static void TMBlockNoTimePopups(void) {
             }
         }
         free(ms);
-        TMLog(@"[POPUP] %@ 拦截 %d 个展示方法", n, blocked);
+
+        // 更强的一层: 弹窗一旦被创建，把它的展示方法整体替换掉，
+        // 并且 hook init，创建后立即隐藏。这样不依赖具体方法名。
+        SEL initSel = sel_registerName("init");
+        Method im = class_getInstanceMethod(c, initSel);
+        if (im) {
+            IMP origInit = method_getImplementation(im);
+            class_replaceMethod(c, initSel,
+                imp_implementationWithBlock(^id(id self_) {
+                    id obj = ((id (*)(id, SEL))origInit)(self_, initSel);
+                    if ([obj isKindOfClass:[UIView class]]) {
+                        UIView *vw = (UIView *)obj;
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            vw.hidden = YES;
+                            vw.alpha = 0.0;
+                            vw.userInteractionEnabled = NO;
+                            [vw removeFromSuperview];
+                        });
+                        TMLog(@"[POPUP] %@ 实例化后已隐藏", n);
+                    }
+                    return obj;
+                }),
+                method_getTypeEncoding(im));
+            blocked++;
+        }
+
+        TMLog(@"[POPUP] %@ 拦截 %d 个入口", n, blocked);
     }
 }
 
