@@ -13,12 +13,16 @@
 static const double kExpireSec = 2398320000.0;
 static NSString * const kExpireText = @"2045-11-01";
 
-// 加速时长单位是「剩余秒数」而不是「到期时间戳」。
-// 依据 Android 侧文案：「加速时长不足2小时」「小时加速时长」「当前可加速时长：」，
-// 可知 ad_free_time / free_time 都是秒数剩余量。
-// 之前误填 kExpireSec(2398320000) 相当于 76 年，界面换算成小时数会溢出成天文数字。
-// 这里给 10 年 = 315360000 秒，界面显示约 87600 小时，落在合理区间。
-static const double kRemainSeconds = 315360000.0;
+// 【单位已实测确认】
+// 日志证据: ad_free_time = 315360000 时界面算出 "有效期至：2626年06月06日"
+//   验算: 2026-10-28 + 315360000分钟 = 2626-06-05，与 2626年06月06日 完全吻合
+//   若按秒则只有 10 年(2036)，对不上
+// 结论: ad_free_time / free_time / vipMinutes 单位统一为「分钟」，
+//       界面的"有效期至"= 当前时间 + 该分钟数。
+//
+// 要让界面自然显示 2045-11-01，需 9998264 分钟（约 19.02 年）。
+// 这里取整为 kRemainMinutes，并保留余量，确保跨年后仍不会回落到更早年份。
+static const double kRemainMinutes = 9998264.0;
 
 // 日志同时写文件，不用抓 syslog 也能拿到诊断
 static NSString *TMLogPath(void) {
@@ -74,7 +78,7 @@ static id TM_ReturnYES(id self, SEL _cmd)  { return @YES; }
 static BOOL TM_ReturnBoolYES(id self, SEL _cmd) { return YES; }
 static id TM_ReturnExpireDate(id self, SEL _cmd) { return [NSDate dateWithTimeIntervalSince1970:kExpireSec]; }
 static id TM_ReturnExpireText(id self, SEL _cmd) { return kExpireText; }
-static id TM_ReturnExpireNum(id self, SEL _cmd)  { return @(kExpireSec); }
+static id TM_ReturnExpireNum(id self, SEL _cmd)  { return @(kRemainMinutes); }
 static long long TM_ReturnZero(id self, SEL _cmd) { return 0; }
 
 static void TMInstallMemberGetters(Class cls, NSString *tag) {
@@ -422,10 +426,10 @@ static void TMHookUserDefaults(void) {
             NSMutableDictionary *u = [(NSDictionary *)value mutableCopy];
             NSArray *before = [u allKeys];
             // 会员身份：分钟数给足
-            u[@"vipMinutes"]    = @(52560000);              // 100 年 × 525600
+            u[@"vipMinutes"]    = @(kRemainMinutes);
             // 加速时长：剩余秒数，10 年
-            u[@"ad_free_time"]  = @(kRemainSeconds);
-            u[@"free_time"]     = @(kRemainSeconds);
+            u[@"ad_free_time"]  = @(kRemainMinutes);
+            u[@"free_time"]     = @(kRemainMinutes);
             u[@"cur_timestamp"] = @((long long)[[NSDate date] timeIntervalSince1970]);
             patched = u;
             TMLog(@"[UD] 写入 UserInformationProduction 被改写，原字段: %@", before);
@@ -479,15 +483,15 @@ static void TMInstallDefaults(void) {
         TMLog(@"找到 UserInformationProduction，字段: %@", [u allKeys]);
 
         // 会员分钟数：100 年
-        u[@"vipMinutes"] = @(52560000);
+        u[@"vipMinutes"] = @(kRemainMinutes);
         // 加速时长：剩余秒数，10 年（不是时间戳）
-        u[@"ad_free_time"] = @(kRemainSeconds);
-        u[@"free_time"]   = @(kRemainSeconds);
+        u[@"ad_free_time"] = @(kRemainMinutes);
+        u[@"free_time"]   = @(kRemainMinutes);
         // 时间基准
         u[@"cur_timestamp"] = @((long long)[[NSDate date] timeIntervalSince1970]);
 
         [d setObject:u forKey:@"UserInformationProduction"];
-        TMLog(@"UserInformationProduction 已改写: vipMinutes=52560000, ad_free_time/free_time=%@ 秒", @(kRemainSeconds));
+        TMLog(@"UserInformationProduction 已改写: 三项时长均为 %@ 分钟", @(kRemainMinutes));
     } else {
         TMLog(@"!! UserInformationProduction 不存在或是非字典类型: %@",
               rawUser ? NSStringFromClass([rawUser class]) : @"nil");
