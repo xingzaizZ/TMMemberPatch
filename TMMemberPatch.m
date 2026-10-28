@@ -722,100 +722,107 @@ static void TMBlockNoTimePopups(void) {
 //   lightningProgressPopupView / lightningErrorPopupView
 // 错误文案: 加速时间已用完 / VPN启动超时失败 / 当前网络不可用 / 加速断卡
 static void TMHookLightningFlow(void) {
-    NSArray *candidates = @[@"TMLightning.TMLightningCenter",
-                            @"TMLightning.TMLightningInterfaceCenter"];
-    Class target = nil;
-    NSString *targetName = nil;
-    for (NSString *n in candidates) {
-        Class c = TMC(n);
-        if (c) { target = c; targetName = n; break; }
-    }
-    if (!target) {
-        TMLog(@"[FLOW] !! 两个候选类都未找到");
-        return;
-    }
-    unsigned int probeCount = 0;
-    Method *probeMethods = class_copyMethodList(target, &probeCount);
-    if (probeMethods) free(probeMethods);
-    TMLog(@"[FLOW] 监控目标: %@ (%u 个实例方法)", targetName, probeCount);
+    // 前两版分别 hook 了 TMLightningInterfaceCenter 与 TMLightningCenter，
+    // 日志都显示加速方法不在里面(actionLightning: 未找到)。
+    // 这次不再猜类名，直接扫运行时所有类，把持有加速方法的那几个找出来。
+    NSMutableArray *holders = [NSMutableArray array];
 
-    // 1) 加速按钮点击
-    SEL actionSel = sel_registerName("actionLightning:");
-    Method am = class_getInstanceMethod(target, actionSel);
-    if (am) {
-        IMP orig = method_getImplementation(am);
-        const char *amTypes = method_getTypeEncoding(am);
-        class_replaceMethod(target, actionSel,
-            imp_implementationWithBlock(^(id self_, id sender) {
-                TMLog(@"[FLOW] >>> actionLightning: sender=%@", sender);
-                if (orig) ((void (*)(id, SEL, id))orig)(self_, actionSel, sender);
-                TMLog(@"[FLOW] <<< actionLightning: 完成");
-            }), amTypes);
-        TMLog(@"[FLOW] actionLightning: 已 hook");
-    } else {
-        TMLog(@"[FLOW] actionLightning: 不在 %@", targetName);
-    }
+    int total = objc_getClassList(NULL, 0);
+    if (total <= 0) { TMLog(@"[SCAN] objc_getClassList 失败"); return; }
+    Class *all = (Class *)malloc(sizeof(Class) * total);
+    if (!all) return;
+    total = objc_getClassList(all, total);
 
-    // 2) 遍历全部实例方法，把加速相关无参方法加日志
-    unsigned int mc = 0;
-    Method *ms = class_copyMethodList(target, &mc);
-    NSMutableArray *hooked = [NSMutableArray array];
-    NSMutableArray *registered = [NSMutableArray array];
-    for (unsigned int i = 0; i < mc; i++) {
-        SEL s = method_getName(ms[i]);
-        NSString *sn = NSStringFromSelector(s);
-        NSString *lc = sn.lowercaseString;
+    for (int i = 0; i < total; i++) {
+        Class c = all[i];
+        NSString *cn = NSStringFromClass(c);
+        if (!cn.length) continue;
+        if (![cn containsString:@"TMLightning"] && ![cn hasPrefix:@"TM"]) continue;
 
-        BOOL relevant = [lc containsString:@"lightning"] ||
-                        [lc containsString:@"speedup"] ||
-                        [lc containsString:@"vpn"] ||
-                        [lc containsString:@"node"] ||
-                        [lc containsString:@"start"] ||
-                        [lc containsString:@"stop"] ||
-                        [lc containsString:@"accel"];
-        if (!relevant) continue;
-        if ([sn isEqualToString:@"actionLightning:"]) continue;
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        if (!ms) continue;
 
-        NSInteger argCount = (NSInteger)[sn componentsSeparatedByString:@":"].count - 1;
-        if (argCount > 0) {
-            [registered addObject:sn];
-            continue;
+        NSInteger score = 0;
+        NSMutableArray *hitSels = [NSMutableArray array];
+        for (unsigned int j = 0; j < mc; j++) {
+            NSString *sn = NSStringFromSelector(method_getName(ms[j]));
+            NSString *lc = sn.lowercaseString;
+            if ([sn isEqualToString:@"actionLightning:"]) { score += 10; [hitSels addObject:sn]; }
+            else if ([lc containsString:@"lightning"])    { score += 3;  [hitSels addObject:sn]; }
+            else if ([lc containsString:@"speedup"])      { score += 3;  [hitSels addObject:sn]; }
+            else if ([lc containsString:@"openvpn"])      { score += 3;  [hitSels addObject:sn]; }
+            else if ([lc containsString:@"vpnstatus"])    { score += 2;  [hitSels addObject:sn]; }
+            else if ([lc containsString:@"progress"])     { score += 1;  [hitSels addObject:sn]; }
         }
+        free(ms);
 
-        const char *types = method_getTypeEncoding(ms[i]);
-        if (!types) continue;
-        IMP orig = method_getImplementation(ms[i]);
-        __block NSString *name = [sn copy];
-        class_replaceMethod(target, s,
-            imp_implementationWithBlock(^(id self_) {
-                TMLog(@"[FLOW] >> %@", name);
-                ((void (*)(id, SEL))orig)(self_, s);
-            }), types);
-        [hooked addObject:sn];
-    }
-    free(ms);
-
-    TMLog(@"[FLOW] 无参方法已挂日志(%lu): %@", (unsigned long)hooked.count,
-          [hooked componentsJoinedByString:@", "]);
-    TMLog(@"[FLOW] 带参方法(%lu, 仅登记): %@", (unsigned long)registered.count,
-          [registered componentsJoinedByString:@", "]);
-
-    // 3) 关键布尔属性: isHadBeginSpeedup 强制为 YES，
-    //    避免"加速时间已用完"这类判断把流程掐断
-    for (NSString *getter in @[@"isHadBeginSpeedup", @"isHadStartVPN",
-                               @"isSpeedTimerStarted", @"hadChoice"]) {
-        SEL gs = sel_registerName(getter.UTF8String);
-        Method gm = class_getInstanceMethod(target, gs);
-        if (gm) {
-            const char *tp = method_getTypeEncoding(gm);
-            const char *ret = method_copyReturnType(gm);
-            if (ret && (ret[0] == 'c' || ret[0] == 'B')) {
-                class_replaceMethod(target, gs, (IMP)TM_ReturnBoolYES, tp);
-                TMLog(@"[FLOW] -%@ -> YES", getter);
-            }
-            if (ret) free((void *)ret);
+        if (score >= 3) {
+            [holders addObject:@{@"cls": cn, @"score": @(score), @"sels": hitSels}];
         }
     }
+    free(all);
+
+    [holders sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [b[@"score"] compare:a[@"score"]];
+    }];
+
+    TMLog(@"[SCAN] 候选类 %lu 个", (unsigned long)holders.count);
+    for (NSDictionary *d in holders) {
+        TMLog(@"[SCAN]   %@ (score=%@) : %@", d[@"cls"], d[@"score"],
+              [d[@"sels"] componentsJoinedByString:@", "]);
+    }
+
+    NSInteger hookedTotal = 0;
+    NSUInteger lim = MIN((NSUInteger)3, holders.count);
+    for (NSUInteger k = 0; k < lim; k++) {
+        NSString *cn = holders[k][@"cls"];
+        Class c = NSClassFromString(cn);
+        if (!c) continue;
+
+        SEL asel = sel_registerName("actionLightning:");
+        Method am = class_getInstanceMethod(c, asel);
+        if (am) {
+            IMP orig = method_getImplementation(am);
+            const char *tp = method_getTypeEncoding(am);
+            class_replaceMethod(c, asel,
+                imp_implementationWithBlock(^(id self_, id sender) {
+                    TMLog(@"[FLOW] >>> actionLightning: 触发");
+                    if (orig) ((void (*)(id, SEL, id))orig)(self_, asel, sender);
+                    TMLog(@"[FLOW] <<< actionLightning: 返回");
+                }), tp);
+            TMLog(@"[FLOW] %@ -actionLightning: 已 hook", cn);
+            hookedTotal++;
+        }
+
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        for (unsigned int j = 0; j < mc; j++) {
+            SEL s = method_getName(ms[j]);
+            NSString *sn = NSStringFromSelector(s);
+            if ([sn isEqualToString:@"actionLightning:"]) continue;
+            NSString *lc = sn.lowercaseString;
+            BOOL rel = [lc containsString:@"lightning"] || [lc containsString:@"speedup"] ||
+                       [lc containsString:@"openvpn"] || [lc containsString:@"vpnstatus"] ||
+                       [lc containsString:@"startvpn"] || [lc containsString:@"stop"];
+            if (!rel) continue;
+            NSInteger argc = (NSInteger)[sn componentsSeparatedByString:@":"].count - 1;
+            if (argc > 0) continue;
+            const char *tp = method_getTypeEncoding(ms[j]);
+            if (!tp) continue;
+            IMP orig = method_getImplementation(ms[j]);
+            __block NSString *name = [sn copy];
+            __block NSString *clsName = [cn copy];
+            class_replaceMethod(c, s,
+                imp_implementationWithBlock(^(id self_) {
+                    TMLog(@"[FLOW] >> %@ -%@", clsName, name);
+                    ((void (*)(id, SEL))orig)(self_, s);
+                }), tp);
+            hookedTotal++;
+        }
+        free(ms);
+    }
+    TMLog(@"[FLOW] 共挂日志 %ld 处", (long)hookedTotal);
 }
 
 #pragma mark - 全局兜底: 扫描所有相关类并注入 getter
