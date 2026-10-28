@@ -296,54 +296,7 @@ static NSDictionary *TMPatchDict(NSDictionary *dict, int depth) {
 
 #pragma mark - 广告层拦截
 
-static id TM_SharedNil(id self, SEL _cmd) { return nil; }
 static void TM_Noop(id self, SEL _cmd) { }
-
-// 把 load/show/present/request 开头的方法改成空实现
-static void TMKillAdMethods(Class cls, NSString *tag) {
-    if (!cls) return;
-    unsigned int n = 0;
-    Method *ms = class_copyMethodList(cls, &n);
-    int killed = 0;
-    for (unsigned int i = 0; i < n; i++) {
-        SEL s = method_getName(ms[i]);
-        NSString *sn = NSStringFromSelector(s);
-        if ([sn hasPrefix:@"load"] || [sn hasPrefix:@"show"] ||
-            [sn hasPrefix:@"present"] || [sn hasPrefix:@"request"] ||
-            [sn hasPrefix:@"start"]) {
-            // 只杀无参或单参的，避免破坏回调签名
-            const char *types = method_getTypeEncoding(ms[i]);
-            if (types && strlen(types) <= 12) {
-                class_replaceMethod(cls, s, (IMP)TM_Noop, types);
-                killed++;
-            }
-        }
-    }
-    free(ms);
-    TMLog(@"%@ 广告方法静默 %d 个", tag, killed);
-}
-
-// 单例置 nil
-static void TMNullifySingletons(Class cls, NSString *tag) {
-    if (!cls) return;
-    Class meta = object_getClass(cls);
-    NSArray *names = @[@"shared", @"sharedInstance", @"shareManager", @"manager",
-                       @"defaultManager", @"share", @"instance"];
-    for (NSString *nm in names) {
-        SEL s = sel_registerName(nm.UTF8String);
-        Method m = class_getClassMethod(cls, s);
-        if (m) {
-            class_replaceMethod(meta, s, (IMP)TM_SharedNil, method_getTypeEncoding(m));
-            TMLog(@"%@ +%@ -> nil", tag, nm);
-        }
-    }
-    // some managers expose -sharedInstance too
-    Method im = class_getInstanceMethod(cls, sel_registerName("sharedInstance"));
-    if (im) {
-        class_replaceMethod(cls, sel_registerName("sharedInstance"), (IMP)TM_SharedNil,
-                            method_getTypeEncoding(im));
-    }
-}
 
 #pragma mark - UI 文案
 
@@ -427,8 +380,98 @@ static Class TMC(NSString *n) {
     return c;
 }
 
+#pragma mark - 拦截 UserDefaults 写入
+
+// App 登录/刷新时会用服务端数据写回 UserInformationProduction，
+// 只在启动时改一次没用。这里 hook setObject:forKey:，
+// 任何写入这个键的动作都先改写成会员态再放行。
+static void TMHookUserDefaults(void) {
+    Class cls = [NSUserDefaults class];
+    SEL sel = @selector(setObject:forKey:);
+    Method orig = class_getInstanceMethod(cls, sel);
+    if (!orig) {
+        TMLog(@"!! NSUserDefaults setObject:forKey: 不存在，无法拦截");
+        return;
+    }
+
+    IMP origIMP = method_getImplementation(orig);
+    IMP newIMP = imp_implementationWithBlock(^void(id self_, id value, NSString *key) {
+        id patched = value;
+
+        if ([key isEqualToString:@"UserInformationProduction"] &&
+            [value isKindOfClass:[NSDictionary class]]) {
+            NSMutableDictionary *u = [(NSDictionary *)value mutableCopy];
+            NSArray *before = [u allKeys];
+            u[@"vipMinutes"]    = @(10000000);
+            u[@"ad_free_time"]  = @(kExpireSec);
+            u[@"free_time"]     = @(kExpireSec);
+            u[@"cur_timestamp"] = @((long long)[[NSDate date] timeIntervalSince1970]);
+            patched = u;
+            TMLog(@"[UD] 写入 UserInformationProduction 被改写，原字段: %@", before);
+        }
+        // 记录所有 vip/ad 相关的键，方便发现新字段
+        else if ([key rangeOfString:@"Vip" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                 [key rangeOfString:@"ad_free" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                 [key rangeOfString:@"UserInfo" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            TMLog(@"[UD] 写入 %@ = %@", key, value);
+            if ([value isKindOfClass:[NSDictionary class]]) {
+                NSMutableDictionary *m = [(NSDictionary *)value mutableCopy];
+                BOOL changed = NO;
+                for (NSString *k in [(NSDictionary *)value allKeys]) {
+                    NSString *lk = [k lowercaseString];
+                    if ([lk containsString:@"vip"] || [lk containsString:@"ad_free"] ||
+                        [lk containsString:@"free_time"] || [lk containsString:@"expire"]) {
+                        id v = m[k];
+                        if ([v isKindOfClass:[NSNumber class]]) {
+                            m[k] = ([v doubleValue] > 1e11) ? @(kExpireSec * 1000.0) : @(kExpireSec);
+                            changed = YES;
+                        } else if ([v isKindOfClass:[NSString class]]) {
+                            m[k] = kExpireText;
+                            changed = YES;
+                        }
+                    }
+                }
+                if (changed) {
+                    patched = m;
+                    TMLog(@"[UD]   已按关键字改写: %@", [patched allKeys]);
+                }
+            }
+        }
+
+        ((void (*)(id, SEL, id, id))origIMP)(self_, @selector(setObject:forKey:), patched, key);
+    });
+    class_replaceMethod(cls, sel, newIMP, method_getTypeEncoding(orig));
+    TMLog(@"NSUserDefaults setObject:forKey: 已 hook");
+}
+
 static void TMInstallDefaults(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    // ---- 第一优先: 改写 UserInformationProduction ----
+    // 实测该键就是 TD 用户态字典，结构为:
+    //   { ad_free_time, free_time, vipMinutes, cur_timestamp, token,
+    //     userAccountName, userAliasName, userId, is18YearOld, ... }
+    // 其中 vipMinutes 是会员剩余分钟数，ad_free_time / free_time 是时长秒数。
+    // 其它键名都是猜测，只有这个是日志里实测到的，必须优先处理。
+    id rawUser = [d objectForKey:@"UserInformationProduction"];
+    if ([rawUser isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *u = [(NSDictionary *)rawUser mutableCopy];
+        TMLog(@"找到 UserInformationProduction，字段: %@", [u allKeys]);
+
+        // 会员分钟数：给一个足够大的值（到 2045 年约 1e7 分钟）
+        u[@"vipMinutes"] = @(10000000);
+        // 免广告时长 / 赠送时长：单位是秒
+        u[@"ad_free_time"] = @(kExpireSec);
+        u[@"free_time"]   = @(kExpireSec);
+        // 时间基准
+        u[@"cur_timestamp"] = @((long long)[[NSDate date] timeIntervalSince1970]);
+
+        [d setObject:u forKey:@"UserInformationProduction"];
+        TMLog(@"UserInformationProduction 已改写: vipMinutes=10000000, ad_free_time/free_time=%@", @(kExpireSec));
+    } else {
+        TMLog(@"!! UserInformationProduction 不存在或是非字典类型: %@",
+              rawUser ? NSStringFromClass([rawUser class]) : @"nil");
+    }
+
     NSArray *keys = @[@"isVip", @"is_vip", @"isVIP", @"ad_free_time", @"adFreeTime",
                       @"free_time", @"vipEndTime", @"vip_end_time", @"expired", @"adEndTime"];
     for (NSString *k in keys) {
@@ -489,18 +532,27 @@ static void TMInstallUserHooks(void) {
     }
 }
 
-static void TMInstallAds(void) {
+// 说明: 原 TMInstallAds 会把广告管理器单例置 nil 并静默 load/show 方法。
+// 实测有两个问题:
+//   1) 日志里"广告方法静默 0 个"，说明方法名不匹配，静默从未生效
+//   2) 单例返回 nil 会让依赖它的启动流程拿到空指针，是白屏的嫌疑源
+// 因此这里只读取并记录方法名，不做任何替换，避免副作用。
+static void TMInspectAds(void) {
     NSArray *ads = @[@"TMLightning.TMAdManager",
                      @"TMLightning.TMSplashAdManager",
                      @"TMLightning.TMInterstitialAdManager",
-                     @"TMLightning.TMRewardedVideoAdManager",
-                     @"TMLightning.TMLookVideoAdViewController"];
+                     @"TMLightning.TMRewardedVideoAdManager"];
     for (NSString *n in ads) {
         Class c = TMC(n);
         if (!c) continue;
-        TMNullifySingletons(c, n);
-        TMKillAdMethods(c, n);
-        TMInstallMemberGetters(c, n);
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        NSMutableArray *names = [NSMutableArray array];
+        for (unsigned int i = 0; i < mc; i++) {
+            [names addObject:NSStringFromSelector(method_getName(ms[i]))];
+        }
+        free(ms);
+        TMLog(@"[AD] %@ 方法(%u): %@", n, mc, [names componentsJoinedByString:@", "]);
     }
 }
 
@@ -802,29 +854,42 @@ static void TMCopyLogToShared(void) {
 __attribute__((constructor))
 static void TMInit(void) {
     @autoreleasepool {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            TMLog(@"==== 注入开始 (TMLightning 2.1.8) ====");
-            [NSURLProtocol registerClass:[TMURLProtocol class]];
+        // constructor 本身在启动早期，不做任何重活，只登记轻量 hook
+        TMLog(@"==== 注入 boot (TMLightning 2.1.8) ====");
+
+        // 1) 立刻装上 UserDefaults 拦截：越早装越好，
+        //    这样 App 后续写服务端数据时才会被改写
+        TMHookUserDefaults();
+
+        // 2) 网络协议注册不耗时，直接装
+        [NSURLProtocol registerClass:[TMURLProtocol class]];
+
+        // 3) 界面出现后再做其余工作，避免拖慢启动
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            TMLog(@"==== 注入阶段2: 开始 ====");
             TMInstallDefaults();
             TMInstallUserHooks();
-            TMInstallAds();
-            TMInstallUI();
             TMInstallIAP();
+            TMInstallUI();
+            TMInspectAds();
+            TMLog(@"==== 注入阶段2: 完成 ====");
+        });
 
-            // 全局兜底：把运行时里所有会员相关类的 getter 拉满
+        // 4) 重量级扫描放后台队列，绝不阻塞主线程（白屏就是它引起的）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+            TMLog(@"==== 宽扫开始(后台) ====");
             TMInstallBroadSweep();
+            TMLog(@"==== 宽扫完成(后台) ====");
+        });
 
-            TMLog(@"==== 注入完成, 免广告权益 -> %@ ====", kExpireText);
-
-            // 延迟 3 秒导出运行时的真实结构，供核对
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                TMDumpRuntime();
-                // 屏幕上弹出诊断摘要，不用抓日志也能看到
-                TMShowDiagAlert();
-                // 尝试把日志复制到可访问位置
-                TMCopyLogToShared();
-            });
+        // 5) 诊断输出，也延后
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            TMDumpRuntime();
+            TMShowDiagAlert();
+            TMCopyLogToShared();
         });
     }
 }
