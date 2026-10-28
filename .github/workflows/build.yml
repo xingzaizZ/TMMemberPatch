@@ -1,0 +1,213 @@
+name: Build Dylib
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: '目标架构'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - arm64
+          - arm64e
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  THEOS: ${{ github.workspace }}/theos
+  SCHEME_NAME: TMMemberPatch
+
+jobs:
+  build:
+    name: Build on macOS
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 显示环境
+        run: |
+          echo "=== Xcode ==="
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+          echo "=== 源码文件 ==="
+          ls -la
+
+      - name: 安装 theos
+        run: |
+          set -e
+          if [ ! -d "$THEOS" ]; then
+            git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          fi
+          mkdir -p "$THEOS/sdks"
+          echo "theos 版本:"
+          ls "$THEOS"
+
+      - name: 准备好 iPhoneOS SDK
+        run: |
+          set -e
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          SDK_VER=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "系统 SDK: $SDK_PATH ($SDK_VER)"
+
+          # theos 需要自带的 SDK 压缩包目录结构；直接把 Xcode SDK 软链过去
+          TARGET_DIR="$THEOS/sdks/iPhoneOS${SDK_VER}.sdk"
+          if [ ! -d "$TARGET_DIR" ]; then
+            ln -sfn "$SDK_PATH" "$TARGET_DIR"
+          fi
+          echo "theos SDK 目录:"
+          ls -la "$THEOS/sdks/" | head -20
+
+      - name: 编译 (clang 直出，双架构)
+        if: ${{ github.event.inputs.arch == '' || github.event.inputs.arch == 'both' }}
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+
+          for ARCH in arm64 arm64e; do
+            echo "===== 编译 $ARCH ====="
+            xcrun --sdk iphoneos clang \
+              -arch "$ARCH" \
+              -miphoneos-version-min=14.0 \
+              -isysroot "$SDK" \
+              -dynamiclib \
+              -fobjc-arc -O2 \
+              -framework Foundation -framework UIKit \
+              -install_name @executable_path/TMMemberPatch.dylib \
+              -o "TMMemberPatch_${ARCH}.dylib" \
+              TMMemberPatch.m
+            file "TMMemberPatch_${ARCH}.dylib"
+          done
+
+          lipo -create \
+            TMMemberPatch_arm64.dylib \
+            TMMemberPatch_arm64e.dylib \
+            -output TMMemberPatch.dylib
+
+          lipo -info TMMemberPatch.dylib
+
+      - name: 编译 (clang 直出，单架构)
+        if: ${{ github.event.inputs.arch == 'arm64' || github.event.inputs.arch == 'arm64e' }}
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          ARCH="${{ github.event.inputs.arch }}"
+          xcrun --sdk iphoneos clang \
+            -arch "$ARCH" \
+            -miphoneos-version-min=14.0 \
+            -isysroot "$SDK" \
+            -dynamiclib \
+            -fobjc-arc -O2 \
+            -framework Foundation -framework UIKit \
+            -install_name @executable_path/TMMemberPatch.dylib \
+            -o TMMemberPatch.dylib \
+            TMMemberPatch.m
+          lipo -info TMMemberPatch.dylib
+
+      - name: theos 交叉验证（可选，失败不阻断）
+        continue-on-error: true
+        run: |
+          set -e
+          make clean || true
+          make package FINALPACKAGE=1
+          echo "=== theos 产物 ==="
+          find . -name "*.dylib" -newermt "-10 minutes" -exec ls -la {} \;
+          find . -name "*.deb" -exec ls -la {} \;
+
+      - name: 签名 (ldid 伪签名)
+        run: |
+          set -e
+          if ! command -v ldid >/dev/null 2>&1; then
+            echo "安装 ldid..."
+            brew install ldid || {
+              echo "brew 失败，改用源编译"
+              git clone --depth 1 https://github.com/ProcursusTeam/ldid.git /tmp/ldid
+              cd /tmp/ldid
+              make CXXFLAGS="-std=c++17" -j$(sysctl -n hw.ncpu)
+              sudo install -m755 ./ldid /usr/local/bin/ldid
+              cd "$GITHUB_WORKSPACE"
+            }
+          fi
+          ldid -S TMMemberPatch.dylib
+          echo "签名完成"
+
+      - name: 校验产物
+        run: |
+          set -e
+          echo "=== 文件信息 ==="
+          file TMMemberPatch.dylib
+          ls -lh TMMemberPatch.dylib
+
+          echo "=== 架构 ==="
+          lipo -info TMMemberPatch.dylib
+
+          echo "=== 导出符号（应含 TMPatch 相关） ==="
+          nm -gU TMMemberPatch.dylib 2>/dev/null | head -30 || true
+
+          echo "=== 依赖库 ==="
+          otool -L TMMemberPatch.dylib
+
+          echo "=== SHA256 ==="
+          shasum -a 256 TMMemberPatch.dylib
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: TMMemberPatch-${{ github.sha }}-${{ github.event.inputs.arch || 'both' }}
+          path: |
+            TMMemberPatch.dylib
+            TMMemberPatch_arm64.dylib
+            TMMemberPatch_arm64e.dylib
+            TMMemberPatch.plist
+            README.md
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: 发布 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            TMMemberPatch.dylib
+            TMMemberPatch_arm64.dylib
+            TMMemberPatch_arm64e.dylib
+            TMMemberPatch.plist
+          generate_release_notes: true
+
+      - name: 构建摘要
+        if: always()
+        run: |
+          {
+            echo "## 构建结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 提交 | \`${{ github.sha }}\` |"
+            echo "| 分支 | \`${{ github.ref_name }}\` |"
+            echo "| 架构 | ${{ github.event.inputs.arch || 'arm64 + arm64e' }} |"
+            echo ""
+            if [ -f TMMemberPatch.dylib ]; then
+              echo "### 产物"
+              echo '```'
+              ls -lh TMMemberPatch.dylib
+              lipo -info TMMemberPatch.dylib
+              shasum -a 256 TMMemberPatch.dylib
+              echo '```'
+            else
+              echo "**构建失败，无产物**"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
