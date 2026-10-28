@@ -13,11 +13,42 @@
 static const double kExpireSec = 2398320000.0;
 static NSString * const kExpireText = @"2045-11-01";
 
+// 日志同时写文件，不用抓 syslog 也能拿到诊断
+static NSString *TMLogPath(void) {
+    static NSString *path = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // 优先写沙盒内，无需越狱权限也能取
+        NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                            NSUserDomainMask, YES);
+        NSString *dir = dirs.firstObject ?: NSTemporaryDirectory();
+        path = [dir stringByAppendingPathComponent:@"tmpatch.log"];
+        // 清空旧日志
+        [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    });
+    return path;
+}
+
 static void TMLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSLog(@"[TMPatch] %@", s);
+
+    // 追加写入文件
+    NSString *line = [NSString stringWithFormat:@"%@ [TMPatch] %@\n",
+                      [NSDate date], s];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:TMLogPath()];
+    if (!fh) {
+        [line writeToFile:TMLogPath() atomically:YES
+                 encoding:NSUTF8StringEncoding error:NULL];
+    } else {
+        @try {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        } @catch (__unused NSException *e) { }
+    }
 }
 
 #pragma mark - 安全 hook 原语
@@ -70,6 +101,47 @@ static void TMInstallMemberGetters(Class cls, NSString *tag) {
 
 #pragma mark - 用户态字典改写
 
+// 递归收集所有叶子字段名，用于日志核对
+static void TMCollectKeys(id obj, NSMutableArray *out, int depth) {
+    if (depth > 6 || !out) return;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        for (id k in (NSDictionary *)obj) {
+            if ([k isKindOfClass:[NSString class]]) [out addObject:k];
+            TMCollectKeys(((NSDictionary *)obj)[k], out, depth + 1);
+        }
+    } else if ([obj isKindOfClass:[NSArray class]]) {
+        for (id item in (NSArray *)obj) {
+            TMCollectKeys(item, out, depth + 1);
+        }
+    }
+}
+
+static NSDictionary *TMPatchDict(NSDictionary *dict, int depth);
+
+// 字段名是否带会员语义。用关键字而非精确名，覆盖逆向没列全的字段。
+static BOOL TMKeyLooksMember(NSString *k) {
+    if (!k.length) return NO;
+    // 排除明显无关的广告 SDK 字段，避免误伤
+    if ([k containsString:@"ad_id"] || [k containsString:@"adid"] ||
+        [k containsString:@"adslot"] || [k containsString:@"adn_"] ||
+        [k containsString:@"adtype"] || [k containsString:@"ad_type"] ||
+        [k hasSuffix:@"_ad"] || [k containsString:@"advert"]) {
+        return NO;
+    }
+    if ([k containsString:@"loadad"] || [k containsString:@"show_ad"] ||
+        [k containsString:@"splash"] || [k containsString:@"interstitial"] ||
+        [k containsString:@"native"]) {
+        return NO;
+    }
+
+    NSArray *words = @[@"vip", @"adfree", @"ad_free", @"member",
+                       @"free_time", @"freetime", @"expire"];
+    for (NSString *w in words) {
+        if ([k containsString:w]) return YES;
+    }
+    return NO;
+}
+
 static NSDictionary *TMPatchDict(NSDictionary *dict, int depth) {
     if (![dict isKindOfClass:[NSDictionary class]]) return dict;
     if (depth > 8) return dict;
@@ -81,21 +153,43 @@ static NSDictionary *TMPatchDict(NSDictionary *dict, int depth) {
 
         id patched = nil;
 
+        // 精确匹配：布尔开关
         if ([[NSSet setWithObjects:@"isvip", @"is_vip", @"isvipmember", @"vip", @"svip",
               @"issvip", @"member", @"ismember", @"is_ad_free", @"isadfree", @"isvipuser", nil]
              containsObject:k] && ![value isKindOfClass:[NSNull class]]) {
             patched = @YES;
         }
+        // 精确匹配：时长（秒/毫秒按量级判断）
         else if ([[NSSet setWithObjects:@"ad_free_time", @"adfreetime", @"free_time", @"freetime",
                    @"sendfreetime", @"vip_end_time", @"vipendtime", @"vipend", @"expire_time",
                    @"expiretime", @"endtime", @"end_time", @"ad_end_time", nil] containsObject:k]) {
             double d = [value respondsToSelector:@selector(doubleValue)] ? [value doubleValue] : 0;
             patched = (d > 1e11) ? @(kExpireSec * 1000.0) : @(kExpireSec);
         }
+        // 精确匹配：日期字符串
         else if ([[NSSet setWithObjects:@"expiredate", @"expire_date", @"validuntil",
                    @"expired", @"vip_end_time_str", @"vip_time", nil] containsObject:k]
                  && [value isKindOfClass:[NSString class]]) {
             patched = kExpireText;
+        }
+        // 关键字匹配：字段名里带会员语义的，按值类型统一改写
+        // 这一步是兜底，覆盖逆向没列全的字段
+        else if (TMKeyLooksMember(k)) {
+            if ([value isKindOfClass:[NSNumber class]]) {
+                // 布尔或小整数 -> YES；时间戳 -> 到期秒数
+                NSNumber *num = (NSNumber *)value;
+                const char *t = [num objCType];
+                if (t && (t[0] == 'c' || t[0] == 'B')) {
+                    patched = @YES;                        // @YES 的底层编码
+                } else {
+                    double d = [num doubleValue];
+                    patched = (d > 1e11) ? @(kExpireSec * 1000.0) : @(kExpireSec);
+                }
+            } else if ([value isKindOfClass:[NSString class]]) {
+                NSNumberFormatter *nf = [[NSNumberFormatter alloc] init];
+                NSNumber *n = [nf numberFromString:(NSString *)value];
+                patched = n ? kExpireText : @"";           // 数字串给日期，其他留空
+            }
         }
         else if ([value isKindOfClass:[NSDictionary class]]) {
             patched = TMPatchDict(value, depth + 1);
@@ -129,16 +223,18 @@ static NSDictionary *TMPatchDict(NSDictionary *dict, int depth) {
     if (![u containsString:@"/api/"]) return NO;
     if ([NSURLProtocol propertyForKey:@"TMHandled" inRequest:request]) return NO;
 
-    static NSArray *keys;
+    // 全量拦截业务接口，不再靠白名单筛。
+    // 原有白名单漏掉了 mobile_data / product_list / ad/get / video_award 四个关键接口。
+    static NSArray *exclude;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        keys = @[@"login", @"/user", @"vip", @"/pay", @"order", @"config", @"init",
-                 @"real_name", @"history_order"];
+        // 只排除明显与会员无关的上报类接口，减少干扰
+        exclude = @[@"reported", @"common_upload", @"sentry", @"log"];
     });
-    for (NSString *k in keys) {
-        if ([u containsString:k]) return YES;
+    for (NSString *k in exclude) {
+        if ([u containsString:k]) return NO;
     }
-    return NO;
+    return YES;
 }
 
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
@@ -166,6 +262,14 @@ static NSDictionary *TMPatchDict(NSDictionary *dict, int depth) {
         if (data.length) {
             id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
             if ([json isKindOfClass:[NSDictionary class]]) {
+                // 把响应里的字段名全部记下来，用于核对真实结构
+                NSString *url = resp.URL.absoluteString ?: @"?";
+                NSString *shortURL = url.length > 80 ? [url substringFromIndex:url.length - 80] : url;
+                NSMutableArray *leafKeys = [NSMutableArray array];
+                TMCollectKeys((NSDictionary *)json, leafKeys, 0);
+                TMLog(@"[REQ] %@", shortURL);
+                TMLog(@"[REQ]   字段: %@", [[NSSet setWithArray:leafKeys] allObjects]);
+
                 NSData *nd = [NSJSONSerialization dataWithJSONObject:TMPatchDict(json, 0) options:0 error:NULL];
                 if (nd) out = nd;
                 NSDictionary *d = (NSDictionary *)json;
