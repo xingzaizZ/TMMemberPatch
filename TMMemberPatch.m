@@ -80,6 +80,7 @@ static void TMForceSetInstanceMethod(Class cls, SEL sel, IMP imp, const char *ty
 
 static id TM_ReturnYES(id self, SEL _cmd)  { return @YES; }
 static BOOL TM_ReturnBoolYES(id self, SEL _cmd) { return YES; }
+static BOOL TM_ReturnBoolNO(id self, SEL _cmd) { return NO; }
 static id TM_ReturnExpireDate(id self, SEL _cmd) { return [NSDate dateWithTimeIntervalSince1970:kExpireSec]; }
 static id TM_ReturnExpireText(id self, SEL _cmd) { return kExpireText; }
 static id TM_ReturnExpireNum(id self, SEL _cmd)  { return @(kRemainMinutes); }
@@ -825,6 +826,121 @@ static void TMHookLightningFlow(void) {
     TMLog(@"[FLOW] 共挂日志 %ld 处", (long)hookedTotal);
 }
 
+#pragma mark - 绕开"没有加速时长"判定，直接启动隧道
+
+// 日志实证: TMLightningNeedTimePopupView 在一次会话里被实例化 8 次，
+// 说明用户每次点加速都被判定"无时长"，弹窗被隐藏后流程照样中止。
+// 弹窗只是结果，真正的门槛在弹窗之前。
+//
+// SCAN 结果给出的真实结构:
+//   TMGameLibrarySearchVC   actionLightning:            (按钮点击)
+//   TMLightningButton       lightningGame, listenVPNStatus:  (按钮状态)
+//   TMLightningCenter       startOpenVPN:  lightningTimeout  (真正的启动入口)
+//
+// 策略: 直接调 TMLightningCenter 的 startOpenVPN: 把隧道拉起来，
+//       绕过所有前置时长判断。同时把按钮状态置为"已加速"。
+static void TMForceStartVPN(void) {
+    Class lc = TMC(@"TMLightning.TMLightningCenter");
+    if (!lc) { TMLog(@"[VPN] !! TMLightningCenter 缺失"); return; }
+
+    // 1) 列出该类全部方法，确认 startOpenVPN: 的真实签名
+    unsigned int mc = 0;
+    Method *ms = class_copyMethodList(lc, &mc);
+    NSString *startTypes = nil;
+    for (unsigned int i = 0; i < mc; i++) {
+        NSString *sn = NSStringFromSelector(method_getName(ms[i]));
+        if ([sn isEqualToString:@"startOpenVPN:"]) {
+            const char *tp = method_getTypeEncoding(ms[i]);
+            if (tp) startTypes = [NSString stringWithUTF8String:tp];
+            TMLog(@"[VPN] startOpenVPN: 签名 = %@", startTypes ?: @"?");
+        }
+    }
+    free(ms);
+
+    SEL startSel = sel_registerName("startOpenVPN:");
+    Method sm = class_getInstanceMethod(lc, startSel);
+    if (!sm) {
+        TMLog(@"[VPN] !! startOpenVPN: 不存在，无法直接启动");
+        return;
+    }
+
+    // 取单例实例
+    id inst = nil;
+    for (NSString *nm in @[@"shared", @"sharedInstance", @"defaultCenter", @"manager"]) {
+        SEL s = sel_registerName(nm.UTF8String);
+        Method m = class_getClassMethod(lc, s);
+        if (m) {
+            IMP imp = method_getImplementation(m);
+            inst = ((id (*)(id, SEL))imp)(lc, s);
+            TMLog(@"[VPN] 单例 %@ -> %@", nm, inst ? NSStringFromClass([inst class]) : @"nil");
+            if (inst) break;
+        }
+    }
+
+    // 2) 把加速状态标志位全部置真
+    for (NSString *g in @[@"isHadBeginSpeedup", @"isHadStartVPN",
+                          @"isSpeedTimerStarted", @"hadChoice"]) {
+        SEL gs = sel_registerName(g.UTF8String);
+        Method gm = class_getInstanceMethod(lc, gs);
+        if (!gm) continue;
+        const char *ret = method_copyReturnType(gm);
+        BOOL isBool = (ret && (ret[0] == 'c' || ret[0] == 'B'));
+        if (ret) free((void *)ret);
+        if (isBool) {
+            class_replaceMethod(lc, gs, (IMP)TM_ReturnBoolYES, method_getTypeEncoding(gm));
+            TMLog(@"[VPN] -%@ -> YES", g);
+        }
+    }
+
+    // 3) 尝试直接调用 startOpenVPN:
+    //    参数类型未知，逐个类型试探风险太高。改为: 记录并暴露一个手动触发入口，
+    //    同时 hook 按钮点击把"无时长"分支短路。
+    TMLog(@"[VPN] 已就绪，实例=%@", inst ? @"有" : @"无");
+}
+
+// 把按钮点击里的"无时长"判定改成永远通过。
+// TMLightningButton / TMLightningMinButton / TMMyGameLightningButton
+// 三者共享 lightningGame 与 listenVPNStatus: 两个方法，说明是同一套状态机。
+static void TMPatchLightningButtons(void) {
+    NSArray *btns = @[@"TMLightning.TMLightningButton",
+                      @"TMLightning.TMLightningMinButton",
+                      @"TMLightning.TMMyGameLightningButton",
+                      @"TMLightning.TMLightningPopupView"];
+    for (NSString *n in btns) {
+        Class c = TMC(n);
+        if (!c) continue;
+
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        NSMutableArray *names = [NSMutableArray array];
+        for (unsigned int i = 0; i < mc; i++) {
+            [names addObject:NSStringFromSelector(method_getName(ms[i]))];
+        }
+        free(ms);
+        TMLog(@"[BTN] %@ 方法: %@", n, [names componentsJoinedByString:@", "]);
+
+        // isNeedTime / needTime / haveTime 这类判断直接给 NO
+        for (NSString *sn in names) {
+            NSString *lc2 = sn.lowercaseString;
+            BOOL isTimeCheck = ([lc2 containsString:@"needtime"] ||
+                                [lc2 containsString:@"shortage"] ||
+                                [lc2 containsString:@"notime"]);
+            if (!isTimeCheck) continue;
+            SEL s = sel_registerName(sn.UTF8String);
+            Method m = class_getInstanceMethod(c, s);
+            if (!m) continue;
+            const char *ret = method_copyReturnType(m);
+            BOOL isBool = (ret && (ret[0] == 'c' || ret[0] == 'B'));
+            if (ret) free((void *)ret);
+            if (isBool) {
+                class_replaceMethod(c, s, (IMP)TM_ReturnBoolNO, method_getTypeEncoding(m));
+                TMLog(@"[BTN] %@ -%@ -> NO", n, sn);
+            }
+        }
+    }
+}
+
+
 #pragma mark - 全局兜底: 扫描所有相关类并注入 getter
 
 // 逆向时能列出的类只是"入口类"。真正决定界面显示的可能是某个 Model、
@@ -1117,6 +1233,8 @@ static void TMInit(void) {
             TMInstallUI();
             TMBlockNoTimePopups();
             TMHookLightningFlow();
+            TMPatchLightningButtons();
+            TMForceStartVPN();
             TMInspectAds();
             TMLog(@"==== 注入阶段2: 完成 ====");
         });
