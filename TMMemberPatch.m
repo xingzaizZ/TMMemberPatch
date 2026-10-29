@@ -901,6 +901,107 @@ static void TMForceStartVPN(void) {
 // 把按钮点击里的"无时长"判定改成永远通过。
 // TMLightningButton / TMLightningMinButton / TMMyGameLightningButton
 // 三者共享 lightningGame 与 listenVPNStatus: 两个方法，说明是同一套状态机。
+
+#pragma mark - 网络层定位与响应改写
+
+// 日志显示 [REQ] 从未出现，说明 TMURLProtocol 完全没被调用。
+// 原因: App 不用标准 NSURLSession 协议栈，而是自己封装了一套:
+//   post:params:header:timeOut:mode:start:finish:result:progress:
+//   requestWithBaseURL:params:httpMethod:bParamsEncrypto:tag:appKey:appSecret:responsBlack:
+// 注意 bParamsEncrypto / appKey / appSecret —— 请求参数是加密签名的。
+//
+// 因此要拦响应，必须先找到实现这些方法的类，不能再靠 NSURLProtocol。
+static void TMScanNetworkLayer(void) {
+    int total = objc_getClassList(NULL, 0);
+    if (total <= 0) return;
+    Class *all = (Class *)malloc(sizeof(Class) * total);
+    if (!all) return;
+    total = objc_getClassList(all, total);
+
+    NSMutableArray *cands = [NSMutableArray array];
+
+    for (int i = 0; i < total; i++) {
+        Class c = all[i];
+        NSString *cn = NSStringFromClass(c);
+        if (!cn.length) continue;
+        // 只看主程序，排除广告 SDK
+        if (![cn containsString:@"TMLightning"] && ![cn hasPrefix:@"TM"]) continue;
+
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        if (!ms) continue;
+
+        NSInteger score = 0;
+        NSMutableArray *hits = [NSMutableArray array];
+        for (unsigned int j = 0; j < mc; j++) {
+            NSString *sn = NSStringFromSelector(method_getName(ms[j]));
+            NSString *lc = sn.lowercaseString;
+            // 自定义网络层特征
+            if ([sn hasPrefix:@"post:params:header:"] ||
+                [sn hasPrefix:@"post:param:"] ||
+                [sn hasPrefix:@"requestWithBaseURL:"]) {
+                score += 10;
+                [hits addObject:sn];
+            }
+            else if ([lc containsString:@"encrypto"] || [lc containsString:@"encrypt"]) {
+                score += 5;
+                [hits addObject:sn];
+            }
+            else if ([lc containsString:@"responsblack"] || [lc containsString:@"responseblack"]) {
+                score += 5;
+                [hits addObject:sn];
+            }
+        }
+        free(ms);
+
+        if (score > 0) {
+            [cands addObject:@{@"cls": cn, @"score": @(score), @"sels": hits}];
+        }
+    }
+    free(all);
+
+    [cands sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [b[@"score"] compare:a[@"score"]];
+    }];
+
+    TMLog(@"[NET] 网络层候选类 %lu 个", (unsigned long)cands.count);
+    for (NSDictionary *d in cands) {
+        TMLog(@"[NET]   %@ (score=%@) : %@",
+              d[@"cls"], d[@"score"],
+              [d[@"sels"] componentsJoinedByString:@", "]);
+    }
+
+    // 对前两名挂日志，记录实际请求的 URL
+    for (NSUInteger k = 0; k < MIN((NSUInteger)2, cands.count); k++) {
+        NSString *cn = cands[k][@"cls"];
+        Class c = NSClassFromString(cn);
+        if (!c) continue;
+
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        for (unsigned int j = 0; j < mc; j++) {
+            SEL s = method_getName(ms[j]);
+            NSString *sn = NSStringFromSelector(s);
+            if (![sn hasPrefix:@"post:params:header:"] && ![sn hasPrefix:@"post:param:"]) continue;
+
+            const char *tp = method_getTypeEncoding(ms[j]);
+            if (!tp) continue;
+            IMP orig = method_getImplementation(ms[j]);
+            __block NSString *name = [sn copy];
+            __block NSString *clsName = [cn copy];
+            class_replaceMethod(c, s,
+                imp_implementationWithBlock(^(id self_, id a1, id a2) {
+                    TMLog(@"[NET] >> %@ -%@  a1=%@ a2=%@", clsName, name,
+                          [a1 isKindOfClass:[NSString class]] ? a1 : NSStringFromClass([a1 class]),
+                          [a2 isKindOfClass:[NSString class]] ? a2 : NSStringFromClass([a2 class]));
+                    ((void (*)(id, SEL, id, id))orig)(self_, s, a1, a2);
+                }), tp);
+            TMLog(@"[NET] %@ -%@ 已挂日志", cn, sn);
+        }
+        free(ms);
+    }
+}
+
 static void TMPatchLightningButtons(void) {
     NSArray *btns = @[@"TMLightning.TMLightningButton",
                       @"TMLightning.TMLightningMinButton",
@@ -1233,6 +1334,7 @@ static void TMInit(void) {
             TMInstallUI();
             TMBlockNoTimePopups();
             TMHookLightningFlow();
+            TMScanNetworkLayer();
             TMPatchLightningButtons();
             TMForceStartVPN();
             TMInspectAds();
