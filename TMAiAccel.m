@@ -552,11 +552,16 @@ static void TMInstallSplashScanner(void) {
         self.hidden = YES;
     }]];
 
+    // 找宿主 App 的 rootViewController（避开自身这个悬浮窗口）
     UIViewController *root = nil;
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        if (w.isKeyWindow && w != self) { root = w.rootViewController; break; }
+        if (w == self) continue;
+        if (w.rootViewController) { root = w.rootViewController; break; }
     }
-    if (!root) root = [UIApplication sharedApplication].keyWindow.rootViewController;
+    // 若取到的是被 present 的控制器，回溯到最底层
+    while (root.presentedViewController) {
+        root = root.presentedViewController;
+    }
     if (root) [root presentViewController:ac animated:YES completion:nil];
 }
 
