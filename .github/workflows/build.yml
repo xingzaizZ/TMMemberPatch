@@ -80,28 +80,34 @@ jobs:
           set -e
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 
-          for ARCH in arm64 arm64e; do
-            echo "===== 编译 $ARCH ====="
-            xcrun --sdk iphoneos clang \
-              -arch "$ARCH" \
-              -miphoneos-version-min=14.0 \
-              -isysroot "$SDK" \
-              -dynamiclib \
-              -fobjc-arc -O2 \
-              -framework Foundation -framework UIKit -framework CoreGraphics \
-              -framework AVFoundation -framework CoreMotion -framework WebKit \
-              -install_name @executable_path/TMMemberPatch.dylib \
-              -o "TMMemberPatch_${ARCH}.dylib" \
-              TMMemberPatch.m TMAiAccel.m
-            file "TMMemberPatch_${ARCH}.dylib"
-          done
+          # 产出两件独立插件:
+          #   TMMemberPatch.dylib  会员/免广告权益   (TMMemberPatch.m)
+          #   TMAiAccel.dylib      广告加速+拦截     (TMAiAccel.m)
+          build_one () {
+            NAME="$1"; SRC="$2"; FRAMEWORKS="$3"
+            echo "===== $NAME ====="
+            for ARCH in arm64 arm64e; do
+              echo "  -- $ARCH --"
+              xcrun --sdk iphoneos clang \
+                -arch "$ARCH" \
+                -miphoneos-version-min=14.0 \
+                -isysroot "$SDK" \
+                -dynamiclib \
+                -fobjc-arc -O2 \
+                $FRAMEWORKS \
+                -install_name "@executable_path/${NAME}.dylib" \
+                -o "${NAME}_${ARCH}.dylib" \
+                "$SRC"
+            done
+            lipo -create "${NAME}_arm64.dylib" "${NAME}_arm64e.dylib" -output "${NAME}.dylib"
+            lipo -info "${NAME}.dylib"
+          }
 
-          lipo -create \
-            TMMemberPatch_arm64.dylib \
-            TMMemberPatch_arm64e.dylib \
-            -output TMMemberPatch.dylib
+          FW_COMMON="-framework Foundation -framework UIKit -framework CoreGraphics"
+          FW_AI="$FW_COMMON -framework AVFoundation -framework CoreMotion -framework WebKit"
 
-          lipo -info TMMemberPatch.dylib
+          build_one "TMMemberPatch" "TMMemberPatch.m" "$FW_COMMON"
+          build_one "TMAiAccel"     "TMAiAccel.m"     "$FW_AI"
 
       - name: 编译 (clang 直出，单架构)
         if: ${{ github.event.inputs.arch == 'arm64' || github.event.inputs.arch == 'arm64e' }}
@@ -109,18 +115,23 @@ jobs:
           set -e
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           ARCH="${{ github.event.inputs.arch }}"
+          FW_COMMON="-framework Foundation -framework UIKit -framework CoreGraphics"
+          FW_AI="$FW_COMMON -framework AVFoundation -framework CoreMotion -framework WebKit"
+
           xcrun --sdk iphoneos clang \
-            -arch "$ARCH" \
-            -miphoneos-version-min=14.0 \
-            -isysroot "$SDK" \
-            -dynamiclib \
-            -fobjc-arc -O2 \
-            -framework Foundation -framework UIKit -framework CoreGraphics \
-            -framework AVFoundation -framework CoreMotion -framework WebKit \
+            -arch "$ARCH" -miphoneos-version-min=14.0 -isysroot "$SDK" \
+            -dynamiclib -fobjc-arc -O2 $FW_COMMON \
             -install_name @executable_path/TMMemberPatch.dylib \
-            -o TMMemberPatch.dylib \
-            TMMemberPatch.m TMAiAccel.m
+            -o TMMemberPatch.dylib TMMemberPatch.m
+
+          xcrun --sdk iphoneos clang \
+            -arch "$ARCH" -miphoneos-version-min=14.0 -isysroot "$SDK" \
+            -dynamiclib -fobjc-arc -O2 $FW_AI \
+            -install_name @executable_path/TMAiAccel.dylib \
+            -o TMAiAccel.dylib TMAiAccel.m
+
           lipo -info TMMemberPatch.dylib
+          lipo -info TMAiAccel.dylib
 
       - name: theos 交叉验证（可选，失败不阻断）
         continue-on-error: true
@@ -146,37 +157,40 @@ jobs:
               cd "$GITHUB_WORKSPACE"
             }
           fi
-          ldid -S TMMemberPatch.dylib
+          if [ -f TMMemberPatch.dylib ]; then ldid -S TMMemberPatch.dylib; fi
+          if [ -f TMAiAccel.dylib ];     then ldid -S TMAiAccel.dylib; fi
           echo "签名完成"
 
       - name: 校验产物
         run: |
           set -e
-          echo "=== 文件信息 ==="
-          file TMMemberPatch.dylib
-          ls -lh TMMemberPatch.dylib
-
-          echo "=== 架构 ==="
-          lipo -info TMMemberPatch.dylib
-
-          echo "=== 导出符号（应含 TMPatch 相关） ==="
-          nm -gU TMMemberPatch.dylib 2>/dev/null | head -30 || true
-
-          echo "=== 依赖库 ==="
-          otool -L TMMemberPatch.dylib
-
-          echo "=== SHA256 ==="
-          shasum -a 256 TMMemberPatch.dylib
+          for F in TMMemberPatch TMAiAccel; do
+            if [ ! -f "$F.dylib" ]; then continue; fi
+            echo "=========== $F ==========="
+            file "$F.dylib"
+            ls -lh "$F.dylib"
+            echo "--- 架构 ---"
+            lipo -info "$F.dylib"
+            echo "--- 依赖库 ---"
+            otool -L "$F.dylib"
+            echo "--- SHA256 ---"
+            shasum -a 256 "$F.dylib"
+            echo ""
+          done
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: TMMemberPatch-${{ github.sha }}-${{ github.event.inputs.arch || 'both' }}
+          name: TMPlugins-${{ github.sha }}-${{ github.event.inputs.arch || 'both' }}
           path: |
             TMMemberPatch.dylib
             TMMemberPatch_arm64.dylib
             TMMemberPatch_arm64e.dylib
             TMMemberPatch.plist
+            TMAiAccel.dylib
+            TMAiAccel_arm64.dylib
+            TMAiAccel_arm64e.dylib
+            TMAiAccel.plist
             README.md
           if-no-files-found: error
           retention-days: 90
@@ -187,8 +201,7 @@ jobs:
         with:
           files: |
             TMMemberPatch.dylib
-            TMMemberPatch_arm64.dylib
-            TMMemberPatch_arm64e.dylib
+            TMAiAccel.dylib
             TMMemberPatch.plist
           generate_release_notes: true
 
