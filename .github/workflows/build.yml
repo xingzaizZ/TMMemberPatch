@@ -29,14 +29,11 @@ env:
 jobs:
   build:
     name: Build on macOS
-    # macos-14 是 arm64 runner，容量紧张时排队长达 15 分钟以上会直接失败。
-    # 这里给出回退链：先试 macos-14，抢不到就让 macos-13(intel) 顶上。
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ macos-14, macos-13 ]
+    # 只用 macos-14。实测该 runner 43 秒即可完成构建。
+    # 之前加 macos-13 作回退是错误决策: macos-13 排队 12 小时拿不到机器，
+    # 而 run 整体 status 被它拖成 queued，反而让人误判构建卡住。
+    runs-on: macos-14
+    timeout-minutes: 30
 
     steps:
       - name: 检出代码
