@@ -29,11 +29,10 @@ env:
 jobs:
   build:
     name: Build on macOS
-    # 只用 macos-14。实测该 runner 43 秒即可完成构建。
-    # 之前加 macos-13 作回退是错误决策: macos-13 排队 12 小时拿不到机器，
-    # 而 run 整体 status 被它拖成 queued，反而让人误判构建卡住。
-    runs-on: macos-14
-    timeout-minutes: 30
+    # macos-latest 当前解析到 macos-14，但调度池更大，抢到 runner 的概率更高。
+    # 实测 macos-14 硬编码时会长时间 queued（runner_name 为空，从未分配机器）。
+    runs-on: macos-latest
+    timeout-minutes: 60
 
     steps:
       - name: 检出代码
@@ -90,9 +89,10 @@ jobs:
               -dynamiclib \
               -fobjc-arc -O2 \
               -framework Foundation -framework UIKit \
+              -framework AVFoundation -framework CoreMotion -framework WebKit \
               -install_name @executable_path/TMMemberPatch.dylib \
               -o "TMMemberPatch_${ARCH}.dylib" \
-              TMMemberPatch.m
+              TMMemberPatch.m TMAiAccel.m
             file "TMMemberPatch_${ARCH}.dylib"
           done
 
@@ -116,9 +116,10 @@ jobs:
             -dynamiclib \
             -fobjc-arc -O2 \
             -framework Foundation -framework UIKit \
+            -framework AVFoundation -framework CoreMotion -framework WebKit \
             -install_name @executable_path/TMMemberPatch.dylib \
             -o TMMemberPatch.dylib \
-            TMMemberPatch.m
+            TMMemberPatch.m TMAiAccel.m
           lipo -info TMMemberPatch.dylib
 
       - name: theos 交叉验证（可选，失败不阻断）
